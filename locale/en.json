@@ -1,0 +1,6 @@
+{
+  "meta": {
+    "title": "OIDC Login",
+    "description": "Sign in to the Web UI with an OpenID Connect provider (e.g. a self-hosted Authelia) instead of the launch-token link. Inert until DSH_OIDC_ISSUER is set."
+  }
+}

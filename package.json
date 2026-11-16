@@ -1,0 +1,73 @@
+{
+  "name": "@louisremi/dsh-oidc-login",
+  "version": "0.1.0",
+  "description": "DeepSeek Harness plugin: sign in to dsh web with any OpenID Connect provider (e.g. a self-hosted Authelia) instead of the launch-token link. The token link keeps working.",
+  "keywords": [
+    "authelia",
+    "deepseek-harness",
+    "dsh",
+    "dsh-plugin",
+    "login",
+    "oidc",
+    "openid-connect",
+    "sso"
+  ],
+  "license": "MIT",
+  "author": "louisremi",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/louisremi/dsh-oidc-login.git"
+  },
+  "bugs": {
+    "url": "https://github.com/louisremi/dsh-oidc-login/issues"
+  },
+  "homepage": "https://github.com/louisremi/dsh-oidc-login#readme",
+  "type": "module",
+  "exports": {
+    ".": "./dist/index.js",
+    "./package.json": "./package.json",
+    "./locale/*.json": "./locale/*.json"
+  },
+  "files": [
+    "dist",
+    "src",
+    "cordis.patch.yml",
+    "locale",
+    "README.md",
+    "LICENSE"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "check": "tsc -p tsconfig.json",
+    "format": "biome check --write .",
+    "lint": "biome check .",
+    "prepare": "npm run build",
+    "test": "node --test \"test/*.test.ts\"",
+    "test:e2e": "npm run build && node e2e/dsh.e2e.ts"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "2.6.2",
+    "@types/node": "26.6.5",
+    "typescript": "7.0.2"
+  },
+  "publishConfig": {
+    "access": "public",
+    "provenance": true
+  },
+  "engines": {
+    "node": ">=22"
+  },
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  },
+  "peerDependencies": {
+    "@deepseek-ai/dsh": ">=0.2.2-rc.1"
+  },
+  "peerDependenciesMeta": {
+    "@deepseek-ai/dsh": {
+      "optional": true
+    }
+  }
+}

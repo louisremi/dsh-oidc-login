@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm ci
+      - run: npm run lint
+      - run: npm run check
+      - run: npm test
+      - run: npm pack --dry-run
+
+  e2e:
+    # Boots a real `dsh web` with this plugin against a mock OpenID Provider.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 24
+      - run: npm ci
+      - name: Install the dsh the plugin targets
+        run: npm install --global "@deepseek-ai/dsh@$(node -p "require('./package.json').peerDependencies['@deepseek-ai/dsh'].replace(/^[^0-9]*/, '')")"
+      - run: npm run test:e2e

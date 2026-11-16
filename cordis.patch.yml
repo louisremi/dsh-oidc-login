@@ -1,0 +1,3 @@
+- insert:
+    - id: oidc-login
+      name: "@louisremi/dsh-oidc-login"
