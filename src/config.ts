@@ -8,6 +8,7 @@ export interface RawConfig {
   publicUrl?: string | undefined;
   allowedEmails?: string[] | string | undefined;
   redirectRoot?: boolean | undefined;
+  requireVerifiedEmail?: boolean | undefined;
   scopes?: string[] | undefined;
 }
 
@@ -21,6 +22,13 @@ export interface ResolvedConfig {
   /** Lower-cased e-mail addresses allowed to log in. */
   allowedEmails: Set<string>;
   redirectRoot: boolean;
+  /**
+   * Refuse an identity the provider marks `email_verified: false`. Some
+   * providers only set it on self-signup (Pocket ID, unless an admin ticks the
+   * address), so a deployment whose accounts it creates itself can turn this
+   * off; the allow-list still decides who gets in.
+   */
+  requireVerifiedEmail: boolean;
   scopes: string[];
 }
 
@@ -88,11 +96,22 @@ export function resolveConfig(raw: RawConfig | undefined, env: Env = process.env
       throw new Error('DSH_OIDC_ALLOWED_EMAILS is empty; refusing to accept any OIDC login');
     }
     const redirectRoot = raw?.redirectRoot ?? env.DSH_OIDC_REDIRECT_ROOT !== '0';
+    const requireVerifiedEmail =
+      raw?.requireVerifiedEmail ?? (env.DSH_OIDC_REQUIRE_VERIFIED_EMAIL ?? '1') !== '0';
     const scopes = raw?.scopes ?? ['openid', 'email', 'profile'];
     if (!scopes.includes('openid')) throw new Error('scopes must include openid');
     return {
       kind: 'enabled',
-      config: { issuer, clientId, clientSecret, publicUrl, allowedEmails, redirectRoot, scopes },
+      config: {
+        issuer,
+        clientId,
+        clientSecret,
+        publicUrl,
+        allowedEmails,
+        redirectRoot,
+        requireVerifiedEmail,
+        scopes,
+      },
     };
   } catch (error) {
     return { kind: 'invalid', reason: error instanceof Error ? error.message : String(error) };

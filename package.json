@@ -1,6 +1,6 @@
 {
   "name": "@louisremi/dsh-oidc-login",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "DeepSeek Harness plugin: sign in to dsh web with any OpenID Connect provider (e.g. a self-hosted Authelia) instead of the launch-token link. The token link keeps working.",
   "keywords": [
     "authelia",
@@ -26,7 +26,8 @@
   "exports": {
     ".": "./dist/index.js",
     "./package.json": "./package.json",
-    "./locale/*.json": "./locale/*.json"
+    "./locale/*.json": "./locale/*.json",
+    "./client": "./dist/client.js"
   },
   "files": [
     "dist",
@@ -37,7 +38,7 @@
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc -p tsconfig.build.json",
+    "build": "tsc -p tsconfig.build.json && tsc -p tsconfig.client.json",
     "check": "tsc -p tsconfig.json",
     "format": "biome check --write .",
     "lint": "biome check .",
@@ -60,6 +61,13 @@
   "dsh": {
     "bundle": {
       "patch": "./cordis.patch.yml"
+    },
+    "client": {
+      "platform": "web",
+      "immediately": true,
+      "inject": [
+        "@deepseek-ai/dsh-client-ui-settings-general"
+      ]
     }
   },
   "peerDependencies": {

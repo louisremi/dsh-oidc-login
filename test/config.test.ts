@@ -72,6 +72,13 @@ test('an inline secret is accepted and always removed from the environment', () 
   assert.equal('DSH_OIDC_CLIENT_SECRET' in disabledEnv, false);
 });
 
+test('email verification is required by default and can be turned off', () => {
+  const strict = resolveConfig(undefined, { ...base });
+  assert.equal(strict.kind === 'enabled' && strict.config.requireVerifiedEmail, true);
+  const relaxed = resolveConfig(undefined, { ...base, DSH_OIDC_REQUIRE_VERIFIED_EMAIL: '0' });
+  assert.equal(relaxed.kind === 'enabled' && relaxed.config.requireVerifiedEmail, false);
+});
+
 test('DSH_OIDC_REDIRECT_ROOT=0 turns the root redirect off', () => {
   const result = resolveConfig(undefined, { ...base, DSH_OIDC_REDIRECT_ROOT: '0' });
   assert.equal(result.kind === 'enabled' && result.config.redirectRoot, false);
@@ -109,7 +116,7 @@ test('apply registers nothing when not configured, and says so', () => {
   } finally {
     if (saved !== undefined) process.env.DSH_OIDC_ISSUER = saved;
   }
-  assert.deepEqual(routes, []);
+  assert.deepEqual(routes, ['/auth/status']);
   assert.match(logger.lines.join('\n'), /oidc-login: not configured/u);
 });
 
@@ -122,7 +129,7 @@ test('apply registers nothing and logs an error when the config is invalid', () 
     publicUrl: 'https://dsh.example',
     allowedEmails: [],
   });
-  assert.deepEqual(routes, []);
+  assert.deepEqual(routes, ['/auth/status']);
   assert.match(logger.lines.join('\n'), /disabled, configuration is invalid: .*ALLOWED_EMAILS/u);
 });
 
@@ -135,5 +142,11 @@ test('apply registers the sign-in routes when configured', () => {
     publicUrl: 'https://dsh.example',
     allowedEmails: ['owner@example.com'],
   });
-  assert.deepEqual(routes.sort(), ['/', '/auth/callback', '/auth/login', '/auth/logout']);
+  assert.deepEqual(routes.sort(), [
+    '/',
+    '/auth/callback',
+    '/auth/login',
+    '/auth/logout',
+    '/auth/status',
+  ]);
 });

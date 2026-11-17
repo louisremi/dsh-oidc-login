@@ -51,6 +51,26 @@ Sign-in only works on the host of `DSH_OIDC_PUBLIC_URL`: dsh binds its
 cookie to the request's Host, so other addresses (the container IP, a LAN
 name) keep dsh's plain 401 and the token link.
 
+## Sign out in the settings page
+
+The plugin ships a client half: a **Sign out** row at the end of **Settings →
+General** that links to `/auth/logout`. It renders only when `/auth/status`
+reports the Host half configured, and it lives in the `settings.general.item`
+slot, so it follows the host's theme and disappears with the settings page.
+
+It signs out **this browser**: dsh has no server-side session store, so other
+devices keep their cookie until it expires (delete dsh's
+`client-connection/browser-session` credential to revoke all of them).
+
+## `email_verified` and self-hosted providers
+
+Pocket ID sets `email_verified: true` only on self-signup or when an admin ticks
+the address; the first account created at `/setup` is marked unverified unless
+you tick it. Because this plugin refuses an unverified identity by default,
+such a login fails with `… is not verified by the provider`. Either verify the
+address in the provider, or set `DSH_OIDC_REQUIRE_VERIFIED_EMAIL=0` — the
+allow-list still decides who gets in.
+
 ## Limits
 
 - dsh has no server-side session store: logout clears the browser's cookie

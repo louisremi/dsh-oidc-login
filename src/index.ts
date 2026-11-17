@@ -23,6 +23,21 @@ const consoleLogger: Logger = {
 export function apply(ctx: PluginContext, raw?: RawConfig): void {
   const logger = ctx.logger ?? consoleLogger;
   const result = resolveConfig(raw);
+  // The browser half asks this before offering its "Sign out" row, so an
+  // installed-but-unconfigured plugin adds no UI.
+  const enabled = result.kind === 'enabled';
+  ctx.effect(
+    () =>
+      ctx.webServer.register({
+        kind: 'exact',
+        path: '/auth/status',
+        handler: (_req, res) => {
+          res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
+          res.end(JSON.stringify({ enabled }));
+        },
+      }),
+    'oidc-login: /auth/status',
+  );
   if (result.kind === 'disabled') {
     logger.info(`oidc-login: not configured (${result.reason}); token login only`);
     return;

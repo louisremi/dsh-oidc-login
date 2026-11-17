@@ -241,8 +241,12 @@ export class LoginRoutes {
     if (!this.deps.config.allowedEmails.has(email)) {
       return this.denied(res, `${identity.email} is not in DSH_OIDC_ALLOWED_EMAILS`);
     }
-    if (identity.emailVerified === false)
-      return this.denied(res, `${identity.email} is not verified`);
+    if (identity.emailVerified === false && this.deps.config.requireVerifiedEmail) {
+      return this.denied(
+        res,
+        `${identity.email} is not verified by the provider (set DSH_OIDC_REQUIRE_VERIFIED_EMAIL=0 to accept it)`,
+      );
+    }
 
     // Mint dsh's own session cookie by replaying its launch-token exchange in-process.
     // The token never leaves this process; dsh signs the cookie for the request's Host.

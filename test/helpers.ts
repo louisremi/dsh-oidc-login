@@ -60,6 +60,7 @@ export function config(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig 
     publicUrl: 'https://dsh.example',
     allowedEmails: new Set(['owner@example.com']),
     redirectRoot: true,
+    requireVerifiedEmail: true,
     scopes: ['openid', 'email', 'profile'],
     ...overrides,
   };
