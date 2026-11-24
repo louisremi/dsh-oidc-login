@@ -1,5 +1,6 @@
 import { type RawConfig, resolveConfig } from './config.ts';
 import type { Logger, PluginContext } from './context.ts';
+import { resolveDshAuth } from './dsh-auth.ts';
 import { OidcClient } from './oidc.ts';
 import { CALLBACK_PATH, LOGIN_PATH, LOGOUT_PATH, LoginRoutes } from './routes.ts';
 
@@ -31,6 +32,7 @@ export function apply(ctx: PluginContext, raw?: RawConfig): void {
       ctx.webServer.register({
         kind: 'exact',
         path: '/auth/status',
+        auth: 'anonymous',
         handler: (_req, res) => {
           res.writeHead(200, { 'content-type': 'application/json', 'cache-control': 'no-store' });
           res.end(JSON.stringify({ enabled }));
@@ -48,12 +50,8 @@ export function apply(ctx: PluginContext, raw?: RawConfig): void {
     return;
   }
   const { config } = result;
-  const { connection, webServer } = ctx;
-  if (
-    typeof connection.authorizeIndex !== 'function' ||
-    typeof connection.authenticatedUrl !== 'function' ||
-    typeof webServer.readResource !== 'function'
-  ) {
+  const auth = resolveDshAuth(ctx);
+  if (auth === undefined) {
     logger.error('oidc-login: disabled, this dsh lacks the connection/webServer APIs it needs');
     return;
   }
@@ -61,13 +59,15 @@ export function apply(ctx: PluginContext, raw?: RawConfig): void {
   const routes = new LoginRoutes({
     config,
     oidc,
-    connection: ctx.connection,
+    auth,
     webServer: ctx.webServer,
     logger,
   });
+  // Since dsh 0.2.3 routes require authentication unless declared otherwise;
+  // these are the sign-in endpoints, so they are anonymous (older dsh ignores `auth`).
   const register = (path: string, handler: LoginRoutes['login']) =>
     ctx.effect(
-      () => ctx.webServer.register({ kind: 'exact', path, handler }),
+      () => ctx.webServer.register({ kind: 'exact', path, handler, auth: 'anonymous' }),
       `oidc-login: ${path}`,
     );
   register(LOGIN_PATH, routes.login);

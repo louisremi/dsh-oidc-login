@@ -1,7 +1,8 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ResolvedConfig } from './config.ts';
-import type { ConnectionService, Logger, RequestLike, WebServerService } from './context.ts';
+import type { Logger, RequestLike, WebServerService } from './context.ts';
+import type { Captured, DshAuth } from './dsh-auth.ts';
 import { type OidcClient, randomToken } from './oidc.ts';
 
 export const LOGIN_PATH = '/auth/login';
@@ -20,7 +21,7 @@ interface Pending {
 export interface RouteDeps {
   config: ResolvedConfig;
   oidc: Pick<OidcClient, 'authorizationUrl' | 'completeLogin' | 'discover'>;
-  connection: ConnectionService;
+  auth: DshAuth;
   webServer: Pick<WebServerService, 'readResource'>;
   logger: Logger;
   now?: () => number;
@@ -81,24 +82,10 @@ export function isHtmlNavigation(req: RequestLike): boolean {
   return (header(req, 'accept') ?? '').includes('text/html');
 }
 
-/** Captures what dsh's authorizeIndex writes, so the caller can decide what to send. */
-class CapturedResponse {
-  status = 200;
-  headers: Record<string, string | string[]> = {};
-  body: string | undefined;
-  writeHead(status: number, headers?: Record<string, string | string[]>): this {
-    this.status = status;
-    this.headers = headers ?? {};
-    return this;
-  }
-  end(body?: string): this {
-    this.body = body;
-    return this;
-  }
-  replay(res: ServerResponse): void {
-    res.writeHead(this.status, this.headers);
-    res.end(this.body);
-  }
+/** Send what dsh answered, unchanged. */
+function replay(res: ServerResponse, reply: Captured): void {
+  res.writeHead(reply.status, reply.headers);
+  res.end(reply.body);
 }
 
 export class LoginRoutes {
@@ -250,19 +237,7 @@ export class LoginRoutes {
 
     // Mint dsh's own session cookie by replaying its launch-token exchange in-process.
     // The token never leaves this process; dsh signs the cookie for the request's Host.
-    const token = new URL(
-      this.deps.connection.authenticatedUrl('http://dsh.invalid/'),
-    ).searchParams.get('token');
-    if (token === null) return this.denied(res, 'dsh did not expose a launch token');
-    const minted = new CapturedResponse();
-    this.deps.connection.authorizeIndex(
-      {
-        method: 'GET',
-        url: `/?token=${encodeURIComponent(token)}`,
-        headers: { host: header(req, 'host') },
-      },
-      minted,
-    );
+    const minted = await this.deps.auth.mintSessionCookie(header(req, 'host'));
     const sessionCookie = minted.headers['set-cookie'];
     if (minted.status !== 303 || sessionCookie === undefined) {
       return this.denied(res, `dsh refused the launch token (status ${minted.status})`);
@@ -316,12 +291,11 @@ export class LoginRoutes {
       res.writeHead(405, { allow: 'GET, HEAD' }).end();
       return;
     }
-    const captured = new CapturedResponse();
-    const authorized = this.deps.connection.authorizeIndex(req, captured);
+    const { authorized, reply } = await this.deps.auth.authorizeIndex(req);
     if (!authorized) {
       const url = new URL(req.url ?? '/', 'http://root.invalid');
       if (
-        captured.status === 401 &&
+        reply.status === 401 &&
         !url.searchParams.has('token') &&
         isHtmlNavigation(req) &&
         this.hostMatches(req)
@@ -330,7 +304,7 @@ export class LoginRoutes {
         res.end();
         return;
       }
-      captured.replay(res);
+      replay(res, reply);
       return;
     }
     // Authenticated: serve the index exactly as dsh's fallback would. "/" is now
@@ -345,7 +319,7 @@ export class LoginRoutes {
         method: req.method === 'HEAD' ? 'HEAD' : 'GET',
         headers,
       }),
-      this.deps.connection.browserPeer,
+      this.deps.auth.browserPeer,
     );
     const out: Record<string, string> = {};
     response.headers.forEach((value, name) => {
