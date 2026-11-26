@@ -4,6 +4,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { resolveConfig } from '../src/config.ts';
+import type { ConnectionService } from '../src/context.ts';
 import { apply } from '../src/index.ts';
 import { fakeConnection, silentLogger } from './helpers.ts';
 
@@ -84,18 +85,21 @@ test('DSH_OIDC_REDIRECT_ROOT=0 turns the root redirect off', () => {
   assert.equal(result.kind === 'enabled' && result.config.redirectRoot, false);
 });
 
-function fakeCtx() {
+function fakeCtx(connection: ConnectionService = fakeConnection()) {
   const routes: string[] = [];
+  const auths: (string | undefined)[] = [];
   const logger = silentLogger();
   return {
     routes,
+    auths,
     logger,
     ctx: {
-      connection: fakeConnection(),
+      connection,
       logger,
       webServer: {
-        register(route: { path: string }) {
+        register(route: { path: string; auth?: string }) {
           routes.push(route.path);
+          auths.push(route.auth);
           return () => {};
         },
         readResource: async () => new Response(null),
@@ -103,9 +107,19 @@ function fakeCtx() {
       effect(callback: () => unknown) {
         return callback();
       },
+      emit() {},
+      waterfall() {},
     },
   };
 }
+
+const configured = () => ({
+  issuer: 'http://127.0.0.1:9',
+  clientId: 'dsh',
+  clientSecretFile: secretFile,
+  publicUrl: 'https://dsh.example',
+  allowedEmails: ['owner@example.com'],
+});
 
 test('apply registers nothing when not configured, and says so', () => {
   const { ctx, routes, logger } = fakeCtx();
@@ -133,15 +147,9 @@ test('apply registers nothing and logs an error when the config is invalid', () 
   assert.match(logger.lines.join('\n'), /disabled, configuration is invalid: .*ALLOWED_EMAILS/u);
 });
 
-test('apply registers the sign-in routes when configured', () => {
-  const { ctx, routes } = fakeCtx();
-  apply(ctx, {
-    issuer: 'http://127.0.0.1:9',
-    clientId: 'dsh',
-    clientSecretFile: secretFile,
-    publicUrl: 'https://dsh.example',
-    allowedEmails: ['owner@example.com'],
-  });
+test('apply registers the sign-in routes when configured, all anonymous (dsh 0.2.3 default is required)', () => {
+  const { ctx, routes, auths } = fakeCtx();
+  apply(ctx, configured());
   assert.deepEqual(routes.sort(), [
     '/',
     '/auth/callback',
@@ -149,4 +157,24 @@ test('apply registers the sign-in routes when configured', () => {
     '/auth/logout',
     '/auth/status',
   ]);
+  assert.deepEqual(new Set(auths), new Set(['anonymous']));
+});
+
+test('apply on dsh 0.2.3+ (no connection.authorizeIndex) uses the Token Provider events', () => {
+  const { ctx, routes, logger } = fakeCtx({ browserPeer: {} });
+  const webServer = ctx.webServer as typeof ctx.webServer & { authorize?: () => unknown };
+  webServer.authorize = () => ({ kind: 'deny', status: 401 });
+  apply(ctx, configured());
+  assert.equal(routes.length, 5);
+  assert.doesNotMatch(logger.lines.join('\n'), /lacks the connection/u);
+});
+
+test('apply stays disabled, and says so, when dsh has neither auth API', () => {
+  const { ctx, routes, logger } = fakeCtx({ browserPeer: {} });
+  apply(ctx, configured());
+  assert.deepEqual(routes, ['/auth/status']);
+  assert.match(
+    logger.lines.join('\n'),
+    /oidc-login: disabled, this dsh lacks the connection\/webServer APIs/u,
+  );
 });

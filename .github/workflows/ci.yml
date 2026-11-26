@@ -23,14 +23,30 @@ jobs:
       - run: npm pack --dry-run
 
   e2e:
-    # Boots a real `dsh web` with this plugin against a mock OpenID Provider.
+    # Boots a real `dsh web` with this plugin against a mock OpenID Provider,
+    # on the oldest dsh the peer range allows and on the newest published one
+    # (dsh 0.2.3 moved browser authentication; only the newest catches that).
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        dsh: [floor, newest]
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
         with:
           node-version: 24
       - run: npm ci
-      - name: Install the dsh the plugin targets
-        run: npm install --global "@deepseek-ai/dsh@$(node -p "require('./package.json').peerDependencies['@deepseek-ai/dsh'].replace(/^[^0-9]*/, '')")"
+      - name: Install dsh (${{ matrix.dsh }})
+        env:
+          WHICH: ${{ matrix.dsh }}
+        run: |
+          if [ "$WHICH" = floor ]; then
+            version="$(node -p "require('./package.json').peerDependencies['@deepseek-ai/dsh'].replace(/^[^0-9]*/, '')")"
+          else
+            # Prereleases included: the peer range is >=X-rc.N and dsh ships mostly prereleases.
+            version="$(npm view @deepseek-ai/dsh time --json | node -e 'const t=JSON.parse(require("fs").readFileSync(0,"utf8")); delete t.created; delete t.modified; console.log(Object.entries(t).sort((a,b)=>a[1].localeCompare(b[1])).at(-1)[0])')"
+          fi
+          echo "dsh $version"
+          npm install --global "@deepseek-ai/dsh@$version"
       - run: npm run test:e2e

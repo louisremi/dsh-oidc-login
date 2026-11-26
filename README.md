@@ -71,13 +71,32 @@ such a login fails with `… is not verified by the provider`. Either verify the
 address in the provider, or set `DSH_OIDC_REQUIRE_VERIFIED_EMAIL=0` — the
 allow-list still decides who gets in.
 
+## dsh compatibility
+
+dsh 0.2.3 moved browser authentication out of the connection service into the
+Token Provider plugin (`@deepseek-ai/dsh-host-authentication-token`; dsh's
+upgrade guide `v0.2.2-rc.2/connection-page-peer`). This plugin supports both
+and picks one at start-up (`src/dsh-auth.ts`):
+- **up to 0.2.2:** `connection.authorizeIndex` and `connection.authenticatedUrl`;
+- **0.2.3 and later:** only public surfaces. The launch token comes from the
+  URL the Token Provider adds to `webserver/entry-url`, and the cookie from
+  replaying `/?token=` through the `webserver/request` middleware. The `/`
+  decision is `webServer.authorize`, the same admission dsh applies to its own
+  routes. The `/auth/*` routes are registered `auth: 'anonymous'`, since dsh
+  0.2.3 routes require a session by default.
+
+With neither API, the plugin logs `oidc-login: disabled, this dsh lacks the
+connection/webServer APIs it needs` and registers no sign-in route; the token
+link keeps working.
+
 ## Limits
 
 - dsh has no server-side session store: logout clears the browser's cookie
   only. To revoke every session at once, delete dsh's
   `client-connection/browser-session` credential and restart dsh.
 - The dsh session lasts dsh's `cookieMaxAgeDays` (30 days by default),
-  independently of the provider's own session.
+  independently of the provider's own session. Since dsh 0.2.3 that setting
+  belongs to the `authentication-token` plugin's config, not `connection`'s.
 - The agent running in dsh acts with the owner's authority and can read
   whatever dsh can, including the client secret file if it is mounted where
   the sandbox lets it read. Keep the secret outside the workspace.

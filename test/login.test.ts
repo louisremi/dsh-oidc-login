@@ -1,6 +1,7 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import { after, before, test } from 'node:test';
+import { resolveDshAuth } from '../src/dsh-auth.ts';
 import { OidcClient } from '../src/oidc.ts';
 import { LoginRoutes } from '../src/routes.ts';
 import {
@@ -26,10 +27,24 @@ function setup(overrides: Parameters<typeof config>[0] = {}) {
   const logger = silentLogger();
   const cfg = config({ issuer: provider.issuer, ...overrides });
   const indexReads: Request[] = [];
+  const webServer = {
+    async readResource(request: Request) {
+      indexReads.push(request);
+      return new Response('<html>dsh</html>', { headers: { 'content-type': 'text/html' } });
+    },
+  };
+  const auth = resolveDshAuth({
+    connection,
+    webServer: { ...webServer, register: () => () => {} },
+    effect: () => undefined,
+    emit: () => {},
+    waterfall: () => undefined,
+  });
+  assert.ok(auth);
   const routes = new LoginRoutes({
     config: cfg,
     oidc: new OidcClient(cfg.issuer, cfg.clientId, cfg.clientSecret),
-    connection,
+    auth,
     webServer: {
       async readResource(request) {
         indexReads.push(request);
