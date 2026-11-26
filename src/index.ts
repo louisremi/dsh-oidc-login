@@ -1,13 +1,13 @@
 import { type RawConfig, resolveConfig } from './config.ts';
 import type { Logger, PluginContext } from './context.ts';
-import { resolveDshAuth } from './dsh-auth.ts';
 import { OidcClient } from './oidc.ts';
 import { CALLBACK_PATH, LOGIN_PATH, LOGOUT_PATH, LoginRoutes } from './routes.ts';
+import { BrowserSessions, CREDENTIAL_KEY, loadSigningKey } from './session.ts';
 
 export const name = 'oidc-login';
 
-/** Services needed before the routes can be registered. */
-export const inject = ['webServer', 'connection'];
+/** Services needed before the routes and the authentication provider can be registered (dsh 0.2.3+). */
+export const inject = ['webServer', 'connection', 'connection.authentication', 'credentials'];
 
 const consoleLogger: Logger = {
   info: (...args) => console.log(...args),
@@ -16,12 +16,14 @@ const consoleLogger: Logger = {
 };
 
 /**
- * Sign in to dsh web with any OpenID Connect provider (e.g. a self-hosted
- * Authelia). A successful login for an allowed e-mail receives dsh's own
- * signed session cookie, exactly as if the launch-token link had been
- * opened; the token link keeps working. Inert until DSH_OIDC_ISSUER is set.
+ * Sign in to dsh web with any OpenID Connect provider (e.g. Pocket ID).
+ * A successful login for an allowed e-mail receives this plugin's own signed
+ * session cookie, which dsh accepts through the authentication provider
+ * registered here: the same seam dsh's own remote login (QR, pairing) uses.
+ * dsh's `/` sign-in page, its token link and its remote login keep working.
+ * Inert until DSH_OIDC_ISSUER is set.
  */
-export function apply(ctx: PluginContext, raw?: RawConfig): void {
+export async function apply(ctx: PluginContext, raw?: RawConfig): Promise<void> {
   const logger = ctx.logger ?? consoleLogger;
   const result = resolveConfig(raw);
   // The browser half asks this before offering its "Sign out" row, so an
@@ -41,30 +43,40 @@ export function apply(ctx: PluginContext, raw?: RawConfig): void {
     'oidc-login: /auth/status',
   );
   if (result.kind === 'disabled') {
-    logger.info(`oidc-login: not configured (${result.reason}); token login only`);
+    logger.info(`oidc-login: not configured (${result.reason}); dsh's own sign-in only`);
     return;
   }
   if (result.kind === 'invalid') {
-    // Fail closed: no sign-in route exists, the token link still works.
+    // Fail closed: no sign-in route exists, dsh's own sign-in still works.
     logger.error(`oidc-login: disabled, configuration is invalid: ${result.reason}`);
     return;
   }
   const { config } = result;
-  const auth = resolveDshAuth(ctx);
-  if (auth === undefined) {
-    logger.error('oidc-login: disabled, this dsh lacks the connection/webServer APIs it needs');
+  for (const warning of result.warnings) logger.warn(`oidc-login: ${warning}`);
+
+  let key: Buffer;
+  try {
+    key = await loadSigningKey(ctx.credentials);
+  } catch (error) {
+    logger.error(
+      `oidc-login: disabled, cannot load the ${CREDENTIAL_KEY} signing key:`,
+      error instanceof Error ? error.message : error,
+    );
     return;
   }
+  const sessions = new BrowserSessions(key, config);
+  const peer = ctx.connection.createPeer({ principal: { kind: 'owner' } });
+  ctx.effect(
+    () =>
+      ctx.connection.authentication.register({
+        authenticate: (request) => (sessions.verify(request) === undefined ? undefined : peer),
+      }),
+    'oidc-login: authentication provider',
+  );
+
   const oidc = new OidcClient(config.issuer, config.clientId, config.clientSecret);
-  const routes = new LoginRoutes({
-    config,
-    oidc,
-    auth,
-    webServer: ctx.webServer,
-    logger,
-  });
-  // Since dsh 0.2.3 routes require authentication unless declared otherwise;
-  // these are the sign-in endpoints, so they are anonymous (older dsh ignores `auth`).
+  const routes = new LoginRoutes({ config, oidc, sessions, logger });
+  // These are the sign-in endpoints, so they are anonymous (dsh requires a session by default).
   const register = (path: string, handler: LoginRoutes['login']) =>
     ctx.effect(
       () => ctx.webServer.register({ kind: 'exact', path, handler, auth: 'anonymous' }),
@@ -73,7 +85,6 @@ export function apply(ctx: PluginContext, raw?: RawConfig): void {
   register(LOGIN_PATH, routes.login);
   register(CALLBACK_PATH, routes.callback);
   register(LOGOUT_PATH, routes.logout);
-  if (config.redirectRoot) register('/', routes.root);
   // Warm the discovery cache so a misconfigured issuer shows up in the logs at start-up.
   oidc.discover().then(
     () =>

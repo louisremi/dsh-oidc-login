@@ -69,11 +69,11 @@ const get = (path: string, headers: Record<string, string> = {}): Promise<Reply>
     req.end();
   });
 const location = (res: Reply) => String(res.headers.location ?? '');
-const pair = (res: Reply, name: string) => {
+const pair = (res: Reply, name: string, except?: string) => {
   const raw = res.headers['set-cookie'] ?? [];
   return (Array.isArray(raw) ? raw : [raw])
     .map((c) => c.split(';')[0] ?? '')
-    .find((c) => c.startsWith(name));
+    .find((c) => c.startsWith(name) && (except === undefined || !c.startsWith(except)));
 };
 
 try {
@@ -82,13 +82,15 @@ try {
     if (child.exitCode !== null || i > 120) throw new Error(`dsh web did not start:\n${output}`);
     await new Promise((r) => setTimeout(r, 500));
   }
-  // dsh routes plugin logs through its own logger (not stdout).
+  // Every entry activates: the plugin no longer competes with dsh for "/".
+  assert.doesNotMatch(output, /did not activate|duplicate exact route/u);
 
-  // Unauthenticated: API-style 401 unchanged, browser navigation redirected.
+  // Unauthenticated: dsh's own sign-in page (token form, device pairing) at "/".
   assert.equal((await get('/')).status, 401);
-  const redirect = await get('/', nav);
-  assert.equal(redirect.status, 302);
-  assert.equal(location(redirect), '/auth/login');
+  const signIn = await get('/', nav);
+  assert.equal(signIn.status, 401);
+  assert.match(await signIn.text(), /dsh-device-pairing/u, "dsh's remote login page");
+  assert.equal((await get('/pairing/client.js')).status, 200);
 
   // Sign in.
   const login = await get('/auth/login', nav);
@@ -98,16 +100,24 @@ try {
   const callback = new URL(provider.approve(location(login)));
   const done = await get(`${callback.pathname}${callback.search}`, { ...nav, cookie: state });
   assert.equal(done.status, 303, await done.text());
-  const session = pair(done, 'dsh-auth-');
-  assert.ok(session, 'dsh session cookie');
+  assert.equal(pair(done, 'dsh-auth-'), undefined, 'the launch token is never used');
+  const session = pair(done, 'dsh-oidc-', 'dsh-oidc-state=');
+  assert.ok(session, 'plugin session cookie');
 
-  // The real dsh accepts the minted cookie: index and /api.
+  // The real dsh accepts it through the registered provider: index and /api.
   const index = await get('/', { ...nav, cookie: session });
   assert.equal(index.status, 200);
-  assert.match(await index.text(), /<html/iu);
+  const html = await index.text();
+  assert.match(html, /<html/iu);
+  assert.doesNotMatch(html, /dsh-device-pairing/u);
   const api = await get('/api/download.file', { cookie: session });
   assert.notEqual(api.status, 401, 'dsh /api accepts the cookie');
   assert.equal((await get('/api/download.file')).status, 401);
+
+  // Logout drops it.
+  const logout = await get('/auth/logout', { ...nav, cookie: session });
+  assert.equal(logout.status, 303);
+  assert.equal(pair(logout, 'dsh-oidc-', 'dsh-oidc-state='), `${session.split('=')[0]}=`);
 
   // The launch-token link still works.
   const token = /dsh web: (\S+)/u.exec(output)?.[1] ?? '';

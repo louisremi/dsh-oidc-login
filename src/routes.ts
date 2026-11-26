@@ -1,9 +1,9 @@
 import { createHash, timingSafeEqual } from 'node:crypto';
 import type { IncomingMessage, ServerResponse } from 'node:http';
 import type { ResolvedConfig } from './config.ts';
-import type { Logger, RequestLike, WebServerService } from './context.ts';
-import type { Captured, DshAuth } from './dsh-auth.ts';
+import type { Logger } from './context.ts';
 import { type OidcClient, randomToken } from './oidc.ts';
+import type { BrowserSessions } from './session.ts';
 
 export const LOGIN_PATH = '/auth/login';
 export const CALLBACK_PATH = '/auth/callback';
@@ -21,8 +21,7 @@ interface Pending {
 export interface RouteDeps {
   config: ResolvedConfig;
   oidc: Pick<OidcClient, 'authorizationUrl' | 'completeLogin' | 'discover'>;
-  auth: DshAuth;
-  webServer: Pick<WebServerService, 'readResource'>;
+  sessions: Pick<BrowserSessions, 'issue' | 'clear'>;
   logger: Logger;
   now?: () => number;
 }
@@ -48,12 +47,12 @@ function page(res: ServerResponse, status: number, title: string, body: string):
   );
 }
 
-function header(req: RequestLike, name: string): string | undefined {
+function header(req: IncomingMessage, name: string): string | undefined {
   const value = req.headers[name];
   return Array.isArray(value) ? value[0] : value;
 }
 
-function readCookie(req: RequestLike, name: string): string | undefined {
+function readCookie(req: IncomingMessage, name: string): string | undefined {
   const raw = header(req, 'cookie');
   if (raw === undefined) return undefined;
   for (const part of raw.split(';')) {
@@ -69,23 +68,19 @@ function sameToken(a: string, b: string): boolean {
   return x.length === y.length && timingSafeEqual(x, y);
 }
 
-/** dsh's browser-session cookie name for an HTTP listener: `dsh-auth-` + base64url(sha256(host)). */
-export function dshCookieName(host: string): string {
-  return `dsh-auth-${createHash('sha256').update(host).digest('base64url')}`;
-}
+const digest = (text: string) => createHash('sha256').update(text).digest('base64url');
 
-/** Whether a request is a top-level browser navigation that expects an HTML page. */
-export function isHtmlNavigation(req: RequestLike): boolean {
-  if (req.method !== 'GET') return false;
-  const mode = header(req, 'sec-fetch-mode');
-  if (mode !== undefined) return mode === 'navigate';
-  return (header(req, 'accept') ?? '').includes('text/html');
-}
-
-/** Send what dsh answered, unchanged. */
-function replay(res: ServerResponse, reply: Captured): void {
-  res.writeHead(reply.status, reply.headers);
-  res.end(reply.body);
+/**
+ * Cookies dsh's own sign-in methods set on an HTTP listener (the usual case
+ * behind a TLS proxy): the launch-token cookie `dsh-auth-<sha256(host)>` and
+ * the QR/pairing cookie `dsh-remote-<sha256(http://host)>`.
+ */
+export function dshCookieNames(host: string): string[] {
+  try {
+    return [`dsh-auth-${digest(host)}`, `dsh-remote-${digest(new URL(`http://${host}`).origin)}`];
+  } catch {
+    return [`dsh-auth-${digest(host)}`];
+  }
 }
 
 export class LoginRoutes {
@@ -107,7 +102,7 @@ export class LoginRoutes {
   }
 
   /** Requests must arrive under the configured public authority: the cookie dsh mints is bound to it. */
-  private hostMatches(req: RequestLike): boolean {
+  private hostMatches(req: IncomingMessage): boolean {
     return (header(req, 'host') ?? '').toLowerCase() === this.publicHost.toLowerCase();
   }
 
@@ -164,7 +159,7 @@ export class LoginRoutes {
         res,
         503,
         'Sign-in unavailable',
-        '<p>The identity provider cannot be reached right now. Try again later, or open the login link printed in the container logs (<code>dsh web: …?token=…</code>).</p>',
+        '<p>The identity provider cannot be reached right now. Try again later, or <a href="/">sign in to dsh another way</a> (launch token or device pairing).</p>',
       );
     }
     this.pending.set(state, entry);
@@ -187,7 +182,7 @@ export class LoginRoutes {
       'set-cookie': this.stateCookie('', 0),
     });
     res.end(
-      `<!doctype html><meta charset="utf-8"><title>Sign-in refused</title><p>Sign-in refused. <a href="${LOGIN_PATH}">Try again</a>.</p>`,
+      `<!doctype html><meta charset="utf-8"><title>Sign-in refused</title><p>Sign-in refused. <a href="${LOGIN_PATH}">Try again</a>, or <a href="/">sign in to dsh another way</a>.</p>`,
     );
   }
 
@@ -235,26 +230,19 @@ export class LoginRoutes {
       );
     }
 
-    // Mint dsh's own session cookie by replaying its launch-token exchange in-process.
-    // The token never leaves this process; dsh signs the cookie for the request's Host.
-    const minted = await this.deps.auth.mintSessionCookie(header(req, 'host'));
-    const sessionCookie = minted.headers['set-cookie'];
-    if (minted.status !== 303 || sessionCookie === undefined) {
-      return this.denied(res, `dsh refused the launch token (status ${minted.status})`);
-    }
     this.deps.logger.info(`oidc-login: ${identity.email} signed in`);
     res.writeHead(303, {
       ...SECURITY_HEADERS,
       location: '/',
-      'set-cookie': [
-        this.stateCookie('', 0),
-        ...(Array.isArray(sessionCookie) ? sessionCookie : [sessionCookie]),
-      ],
+      'set-cookie': [this.stateCookie('', 0), this.deps.sessions.issue(email)],
     });
     res.end();
   };
 
-  /** GET /auth/logout: drop dsh's cookie in this browser, then end the provider session if it can. */
+  /**
+   * GET /auth/logout: drop this plugin's session in this browser, and dsh's
+   * own token and QR/pairing cookies, then end the provider session if it can.
+   */
   logout = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
     const host = header(req, 'host') ?? '';
     let location = '/auth/login';
@@ -275,61 +263,16 @@ export class LoginRoutes {
     res.writeHead(303, {
       ...SECURITY_HEADERS,
       location,
-      'set-cookie': `${dshCookieName(host)}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${this.secure ? '; Secure' : ''}`,
+      'set-cookie': [
+        this.deps.sessions.clear(),
+        ...(host === ''
+          ? []
+          : dshCookieNames(host).map(
+              (name) =>
+                `${name}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax${this.secure ? '; Secure' : ''}`,
+            )),
+      ],
     });
     res.end();
-  };
-
-  /**
-   * GET / : dsh's own index handling, except that a browser navigation that
-   * would get dsh's bare 401 is sent to the sign-in page instead. Token links,
-   * valid cookies, API clients and health checks behave exactly as without
-   * this plugin.
-   */
-  root = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
-    if (req.method !== 'GET' && req.method !== 'HEAD') {
-      res.writeHead(405, { allow: 'GET, HEAD' }).end();
-      return;
-    }
-    const { authorized, reply } = await this.deps.auth.authorizeIndex(req);
-    if (!authorized) {
-      const url = new URL(req.url ?? '/', 'http://root.invalid');
-      if (
-        reply.status === 401 &&
-        !url.searchParams.has('token') &&
-        isHtmlNavigation(req) &&
-        this.hostMatches(req)
-      ) {
-        res.writeHead(302, { ...SECURITY_HEADERS, location: LOGIN_PATH });
-        res.end();
-        return;
-      }
-      replay(res, reply);
-      return;
-    }
-    // Authenticated: serve the index exactly as dsh's fallback would. "/" is now
-    // our handler route, so read the same document through its other name.
-    const headers = new Headers();
-    for (const [name, value] of Object.entries(req.headers)) {
-      for (const item of typeof value === 'string' ? [value] : (value ?? []))
-        headers.append(name, item);
-    }
-    const response = await this.deps.webServer.readResource(
-      new Request('http://dsh.invalid/index.html', {
-        method: req.method === 'HEAD' ? 'HEAD' : 'GET',
-        headers,
-      }),
-      this.deps.auth.browserPeer,
-    );
-    const out: Record<string, string> = {};
-    response.headers.forEach((value, name) => {
-      out[name] = value;
-    });
-    res.writeHead(response.status, out);
-    if (req.method === 'HEAD' || response.body === null) {
-      res.end();
-      return;
-    }
-    res.end(Buffer.from(await response.arrayBuffer()));
   };
 }
