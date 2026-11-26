@@ -4,9 +4,9 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { test } from 'node:test';
 import { resolveConfig } from '../src/config.ts';
-import type { ConnectionService } from '../src/context.ts';
+import type { AuthenticationProvider, CredentialStore } from '../src/context.ts';
 import { apply } from '../src/index.ts';
-import { fakeConnection, silentLogger } from './helpers.ts';
+import { fakeCredentials, silentLogger } from './helpers.ts';
 
 const dir = mkdtempSync(join(tmpdir(), 'oidc-login-'));
 const secretFile = join(dir, 'secret');
@@ -32,7 +32,8 @@ test('resolves from the environment', () => {
   assert.equal(result.config.clientSecret, 'file-secret');
   assert.equal(result.config.publicUrl, 'https://dsh.example');
   assert.deepEqual([...result.config.allowedEmails], ['owner@example.com', 'second@example.com']);
-  assert.equal(result.config.redirectRoot, true);
+  assert.equal(result.config.sessionDays, 30);
+  assert.deepEqual(result.warnings, []);
 });
 
 test('fails closed on an empty allow-list', () => {
@@ -80,21 +81,47 @@ test('email verification is required by default and can be turned off', () => {
   assert.equal(relaxed.kind === 'enabled' && relaxed.config.requireVerifiedEmail, false);
 });
 
-test('DSH_OIDC_REDIRECT_ROOT=0 turns the root redirect off', () => {
+test('DSH_OIDC_REDIRECT_ROOT is ignored since 0.3.0, with a warning', () => {
   const result = resolveConfig(undefined, { ...base, DSH_OIDC_REDIRECT_ROOT: '0' });
-  assert.equal(result.kind === 'enabled' && result.config.redirectRoot, false);
+  assert.equal(result.kind, 'enabled');
+  assert.match(result.kind === 'enabled' ? result.warnings.join() : '', /ignored since 0\.3\.0/u);
 });
 
-function fakeCtx(connection: ConnectionService = fakeConnection()) {
+test('DSH_OIDC_SESSION_DAYS accepts whole days from 1 to 365', () => {
+  const week = resolveConfig(undefined, { ...base, DSH_OIDC_SESSION_DAYS: '7' });
+  assert.equal(week.kind === 'enabled' && week.config.sessionDays, 7);
+  for (const bad of ['0', '366', '1.5', 'x', '-1']) {
+    assert.equal(
+      resolveConfig(undefined, { ...base, DSH_OIDC_SESSION_DAYS: bad }).kind,
+      'invalid',
+      bad,
+    );
+  }
+});
+
+function fakeCtx(credentials: CredentialStore = fakeCredentials()) {
   const routes: string[] = [];
   const auths: (string | undefined)[] = [];
+  const providers: AuthenticationProvider[] = [];
   const logger = silentLogger();
+  const peer = { kind: 'owner-peer' };
   return {
     routes,
     auths,
+    providers,
+    peer,
     logger,
     ctx: {
-      connection,
+      connection: {
+        createPeer: () => peer,
+        authentication: {
+          register(provider: AuthenticationProvider) {
+            providers.push(provider);
+            return async () => {};
+          },
+        },
+      },
+      credentials,
       logger,
       webServer: {
         register(route: { path: string; auth?: string }) {
@@ -102,13 +129,10 @@ function fakeCtx(connection: ConnectionService = fakeConnection()) {
           auths.push(route.auth);
           return () => {};
         },
-        readResource: async () => new Response(null),
       },
       effect(callback: () => unknown) {
         return callback();
       },
-      emit() {},
-      waterfall() {},
     },
   };
 }
@@ -121,60 +145,65 @@ const configured = () => ({
   allowedEmails: ['owner@example.com'],
 });
 
-test('apply registers nothing when not configured, and says so', () => {
-  const { ctx, routes, logger } = fakeCtx();
+test('apply registers nothing when not configured, and says so', async () => {
+  const { ctx, routes, providers, logger } = fakeCtx();
   const saved = process.env.DSH_OIDC_ISSUER;
   delete process.env.DSH_OIDC_ISSUER;
   try {
-    apply(ctx);
+    await apply(ctx);
   } finally {
     if (saved !== undefined) process.env.DSH_OIDC_ISSUER = saved;
   }
   assert.deepEqual(routes, ['/auth/status']);
+  assert.equal(providers.length, 0);
   assert.match(logger.lines.join('\n'), /oidc-login: not configured/u);
 });
 
-test('apply registers nothing and logs an error when the config is invalid', () => {
-  const { ctx, routes, logger } = fakeCtx();
-  apply(ctx, {
-    issuer: 'https://auth.example',
-    clientId: 'dsh',
-    clientSecretFile: secretFile,
-    publicUrl: 'https://dsh.example',
-    allowedEmails: [],
-  });
+test('apply registers nothing and logs an error when the config is invalid', async () => {
+  const { ctx, routes, providers, logger } = fakeCtx();
+  await apply(ctx, { ...configured(), allowedEmails: [] });
   assert.deepEqual(routes, ['/auth/status']);
+  assert.equal(providers.length, 0);
   assert.match(logger.lines.join('\n'), /disabled, configuration is invalid: .*ALLOWED_EMAILS/u);
 });
 
-test('apply registers the sign-in routes when configured, all anonymous (dsh 0.2.3 default is required)', () => {
-  const { ctx, routes, auths } = fakeCtx();
-  apply(ctx, configured());
+test('apply registers the anonymous sign-in routes and one provider, never "/"', async () => {
+  const { ctx, routes, auths, providers } = fakeCtx();
+  await apply(ctx, configured());
   assert.deepEqual(routes.sort(), [
-    '/',
     '/auth/callback',
     '/auth/login',
     '/auth/logout',
     '/auth/status',
   ]);
   assert.deepEqual(new Set(auths), new Set(['anonymous']));
+  assert.equal(providers.length, 1);
 });
 
-test('apply on dsh 0.2.3+ (no connection.authorizeIndex) uses the Token Provider events', () => {
-  const { ctx, routes, logger } = fakeCtx({ browserPeer: {} });
-  const webServer = ctx.webServer as typeof ctx.webServer & { authorize?: () => unknown };
-  webServer.authorize = () => ({ kind: 'deny', status: 401 });
-  apply(ctx, configured());
-  assert.equal(routes.length, 5);
-  assert.doesNotMatch(logger.lines.join('\n'), /lacks the connection/u);
+test('the provider returns the owner Peer only for a valid session cookie', async () => {
+  const credentials = fakeCredentials();
+  const { ctx, providers, peer } = fakeCtx(credentials);
+  await apply(ctx, configured());
+  const { BrowserSessions, loadSigningKey } = await import('../src/session.ts');
+  const sessions = new BrowserSessions(await loadSigningKey(credentials), {
+    publicUrl: 'https://dsh.example',
+    sessionDays: 30,
+    allowedEmails: new Set(['owner@example.com']),
+  });
+  const cookie = sessions.issue('owner@example.com').split(';')[0] ?? '';
+  const provider = providers[0];
+  assert.ok(provider);
+  assert.equal(provider.authenticate({ headers: { host: 'dsh.example', cookie } }), peer);
+  assert.equal(provider.authenticate({ headers: { host: 'dsh.example' } }), undefined);
+  assert.equal(provider.authenticate({ headers: { host: 'other.example', cookie } }), undefined);
 });
 
-test('apply stays disabled, and says so, when dsh has neither auth API', () => {
-  const { ctx, routes, logger } = fakeCtx({ browserPeer: {} });
-  apply(ctx, configured());
-  assert.deepEqual(routes, ['/auth/status']);
-  assert.match(
-    logger.lines.join('\n'),
-    /oidc-login: disabled, this dsh lacks the connection\/webServer APIs/u,
+test('apply fails closed when the signing key record is corrupt', async () => {
+  const { ctx, routes, providers, logger } = fakeCtx(
+    fakeCredentials({ kind: 'grant', payload: { version: 1, secret: 'short' } }),
   );
+  await apply(ctx, configured());
+  assert.deepEqual(routes, ['/auth/status']);
+  assert.equal(providers.length, 0);
+  assert.match(logger.lines.join('\n'), /cannot load the oidc-login\/browser-session signing key/u);
 });

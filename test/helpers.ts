@@ -2,44 +2,20 @@ import { generateKeyPairSync, type KeyObject, sign } from 'node:crypto';
 import { createServer, type IncomingMessage, request, type ServerResponse } from 'node:http';
 import type { AddressInfo } from 'node:net';
 import type { ResolvedConfig } from '../src/config.ts';
-import type { ConnectionService, Logger, RequestLike, ResponseSink } from '../src/context.ts';
+import type { CredentialRecord, CredentialStore, Logger } from '../src/context.ts';
 
-export const LAUNCH_TOKEN = 'launch-token-abc';
-
-/** A fake of dsh's connection service with the same index semantics as BrowserAuth. */
-export function fakeConnection(): ConnectionService & { minted: string[] } {
-  const minted: string[] = [];
+/** An in-memory stand-in for dsh's credential provider (`modifyRecord` only). */
+export function fakeCredentials(initial?: CredentialRecord): CredentialStore & {
+  records: Map<string, CredentialRecord>;
+} {
+  const records = new Map<string, CredentialRecord>();
+  if (initial !== undefined) records.set('oidc-login/browser-session', initial);
   return {
-    minted,
-    browserPeer: { kind: 'owner' },
-    authenticatedUrl(base: string) {
-      const url = new URL(base);
-      url.searchParams.set('token', LAUNCH_TOKEN);
-      return url.href;
-    },
-    authorizeIndex(req: RequestLike, res: ResponseSink) {
-      const url = new URL(req.url ?? '/', 'http://x');
-      const host = req.headers.host as string | undefined;
-      if (url.searchParams.has('token')) {
-        if (url.pathname === '/' && url.searchParams.get('token') === LAUNCH_TOKEN && host) {
-          const value = `cookie-for-${host}`;
-          minted.push(value);
-          res.writeHead(303, {
-            location: './',
-            'set-cookie': `dsh-auth-x=${value}; Path=/; HttpOnly; SameSite=Lax`,
-          });
-          res.end();
-          return false;
-        }
-        res.writeHead(401, { 'content-type': 'text/plain' });
-        res.end('dsh web authentication required\n');
-        return false;
-      }
-      const cookie = (req.headers.cookie as string | undefined) ?? '';
-      if (host && cookie.includes(`dsh-auth-x=cookie-for-${host}`)) return true;
-      res.writeHead(401, { 'content-type': 'text/plain' });
-      res.end('dsh web authentication required\n');
-      return false;
+    records,
+    async modifyRecord(key, mutate) {
+      const next = await mutate(records.get(key));
+      if (next !== undefined) records.set(key, next);
+      return records.get(key);
     },
   };
 }
@@ -59,7 +35,7 @@ export function config(overrides: Partial<ResolvedConfig> = {}): ResolvedConfig 
     clientSecret: 'client-secret',
     publicUrl: 'https://dsh.example',
     allowedEmails: new Set(['owner@example.com']),
-    redirectRoot: true,
+    sessionDays: 30,
     requireVerifiedEmail: true,
     scopes: ['openid', 'email', 'profile'],
     ...overrides,

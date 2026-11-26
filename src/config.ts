@@ -7,7 +7,9 @@ export interface RawConfig {
   clientSecretFile?: string | undefined;
   publicUrl?: string | undefined;
   allowedEmails?: string[] | string | undefined;
+  /** Removed in 0.3.0 (dsh 0.2.3 owns `/`); accepted only to log that it is ignored. */
   redirectRoot?: boolean | undefined;
+  sessionDays?: number | string | undefined;
   requireVerifiedEmail?: boolean | undefined;
   scopes?: string[] | undefined;
 }
@@ -21,7 +23,8 @@ export interface ResolvedConfig {
   publicUrl: string;
   /** Lower-cased e-mail addresses allowed to log in. */
   allowedEmails: Set<string>;
-  redirectRoot: boolean;
+  /** Absolute lifetime of this plugin's browser session, in whole days. */
+  sessionDays: number;
   /**
    * Refuse an identity the provider marks `email_verified: false`. Some
    * providers only set it on self-signup (Pocket ID, unless an admin ticks the
@@ -35,7 +38,7 @@ export interface ResolvedConfig {
 export type ConfigResult =
   | { kind: 'disabled'; reason: string }
   | { kind: 'invalid'; reason: string }
-  | { kind: 'enabled'; config: ResolvedConfig };
+  | { kind: 'enabled'; config: ResolvedConfig; warnings: string[] };
 
 type Env = Record<string, string | undefined>;
 
@@ -95,7 +98,19 @@ export function resolveConfig(raw: RawConfig | undefined, env: Env = process.env
     if (allowedEmails.size === 0) {
       throw new Error('DSH_OIDC_ALLOWED_EMAILS is empty; refusing to accept any OIDC login');
     }
-    const redirectRoot = raw?.redirectRoot ?? env.DSH_OIDC_REDIRECT_ROOT !== '0';
+    const warnings: string[] = [];
+    if (raw?.redirectRoot !== undefined || env.DSH_OIDC_REDIRECT_ROOT !== undefined) {
+      warnings.push(
+        'DSH_OIDC_REDIRECT_ROOT / redirectRoot is ignored since 0.3.0: dsh owns "/"; sign in at /auth/login',
+      );
+    }
+    const daysValue = String(raw?.sessionDays ?? env.DSH_OIDC_SESSION_DAYS ?? '30').trim();
+    const sessionDays = Number(daysValue);
+    if (!/^\d+$/u.test(daysValue) || sessionDays < 1 || sessionDays > 365) {
+      throw new Error(
+        `DSH_OIDC_SESSION_DAYS must be a whole number of days from 1 to 365 (got ${JSON.stringify(daysValue)})`,
+      );
+    }
     const requireVerifiedEmail =
       raw?.requireVerifiedEmail ?? (env.DSH_OIDC_REQUIRE_VERIFIED_EMAIL ?? '1') !== '0';
     const scopes = raw?.scopes ?? ['openid', 'email', 'profile'];
@@ -108,10 +123,11 @@ export function resolveConfig(raw: RawConfig | undefined, env: Env = process.env
         clientSecret,
         publicUrl,
         allowedEmails,
-        redirectRoot,
+        sessionDays,
         requireVerifiedEmail,
         scopes,
       },
+      warnings,
     };
   } catch (error) {
     return { kind: 'invalid', reason: error instanceof Error ? error.message : String(error) };

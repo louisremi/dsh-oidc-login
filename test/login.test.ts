@@ -1,14 +1,14 @@
 import assert from 'node:assert/strict';
 import { generateKeyPairSync } from 'node:crypto';
 import { after, before, test } from 'node:test';
-import { resolveDshAuth } from '../src/dsh-auth.ts';
 import { OidcClient } from '../src/oidc.ts';
 import { LoginRoutes } from '../src/routes.ts';
+import { BrowserSessions, loadSigningKey } from '../src/session.ts';
 import {
   call,
   config,
   cookiePair,
-  fakeConnection,
+  fakeCredentials,
   MockProvider,
   setCookies,
   silentLogger,
@@ -22,38 +22,24 @@ before(async () => {
 });
 after(() => provider.stop());
 
-function setup(overrides: Parameters<typeof config>[0] = {}) {
-  const connection = fakeConnection();
+async function setup(overrides: Parameters<typeof config>[0] = {}) {
   const logger = silentLogger();
   const cfg = config({ issuer: provider.issuer, ...overrides });
-  const indexReads: Request[] = [];
-  const webServer = {
-    async readResource(request: Request) {
-      indexReads.push(request);
-      return new Response('<html>dsh</html>', { headers: { 'content-type': 'text/html' } });
-    },
-  };
-  const auth = resolveDshAuth({
-    connection,
-    webServer: { ...webServer, register: () => () => {} },
-    effect: () => undefined,
-    emit: () => {},
-    waterfall: () => undefined,
-  });
-  assert.ok(auth);
+  const sessions = new BrowserSessions(await loadSigningKey(fakeCredentials()), cfg);
+  const issued: string[] = [];
   const routes = new LoginRoutes({
     config: cfg,
     oidc: new OidcClient(cfg.issuer, cfg.clientId, cfg.clientSecret),
-    auth,
-    webServer: {
-      async readResource(request) {
-        indexReads.push(request);
-        return new Response('<html>dsh</html>', { headers: { 'content-type': 'text/html' } });
+    sessions: {
+      issue(email) {
+        issued.push(email);
+        return sessions.issue(email);
       },
+      clear: () => sessions.clear(),
     },
     logger,
   });
-  return { routes, connection, logger, indexReads };
+  return { routes, sessions, issued, logger };
 }
 
 /** Run /auth/login, approve at the provider, return the callback request inputs. */
@@ -71,7 +57,7 @@ async function startLogin(routes: LoginRoutes) {
 }
 
 test('login redirects to the provider with PKCE S256, state and nonce', async () => {
-  const { routes } = setup();
+  const { routes } = await setup();
   const { location, stateCookie } = await startLogin(routes);
   const url = new URL(location);
   assert.equal(url.origin + url.pathname, `${provider.issuer}/authorize`);
@@ -84,22 +70,29 @@ test('login redirects to the provider with PKCE S256, state and nonce', async ()
   assert.equal(`dsh-oidc-state=${url.searchParams.get('state')}`, stateCookie);
 });
 
-test('a full login for the allowed e-mail gets the dsh session cookie, minted for the request host', async () => {
-  const { routes, connection } = setup();
+test('a full login for the allowed e-mail gets a session cookie that verifies', async () => {
+  const { routes, issued, sessions } = await setup();
   const { stateCookie, path } = await startLogin(routes);
   const res = await call(routes.callback, { path, headers: { ...HOST, cookie: stateCookie } });
   assert.equal(res.status, 303);
   assert.equal(res.headers.location, '/');
   const cookies = setCookies(res.headers);
-  assert.ok(cookies.some((c) => c.startsWith('dsh-auth-x=cookie-for-dsh.example')));
+  const session = cookies.find((c) => c.startsWith(`${sessions.cookieName}=`));
+  assert.ok(session);
+  assert.match(session, /HttpOnly; SameSite=Lax; Secure/u);
+  assert.equal(
+    sessions.verify({ headers: { ...HOST, cookie: cookiePair(session) } }),
+    'owner@example.com',
+  );
   assert.ok(cookies.some((c) => c.startsWith('dsh-oidc-state=;') && c.includes('Max-Age=0')));
-  assert.deepEqual(connection.minted, ['cookie-for-dsh.example']);
+  assert.ok(!cookies.some((c) => c.startsWith('dsh-auth-')), 'never mints dsh token cookies');
+  assert.deepEqual(issued, ['owner@example.com']);
   assert.equal(provider.tokenRequests.at(-1)?.get('grant_type'), 'authorization_code');
   assert.ok(provider.tokenRequests.at(-1)?.get('code_verifier'));
 });
 
 test('the e-mail allow-list is enforced case-insensitively', async () => {
-  const { routes, connection } = setup({ allowedEmails: new Set(['owner@example.com']) });
+  const { routes, issued } = await setup({ allowedEmails: new Set(['owner@example.com']) });
   provider.email = 'Owner@Example.COM';
   try {
     const ok = await startLogin(routes);
@@ -115,14 +108,14 @@ test('the e-mail allow-list is enforced case-insensitively', async () => {
       headers: { ...HOST, cookie: bad.stateCookie },
     });
     assert.equal(res.status, 403);
-    assert.equal(connection.minted.length, 1);
+    assert.equal(issued.length, 1);
   } finally {
     provider.email = 'owner@example.com';
   }
 });
 
 test('an explicitly unverified e-mail is refused', async () => {
-  const { routes } = setup();
+  const { routes } = await setup();
   provider.emailVerified = false;
   try {
     const flow = await startLogin(routes);
@@ -137,7 +130,7 @@ test('an explicitly unverified e-mail is refused', async () => {
 });
 
 test('state must match the browser cookie and can be used only once', async () => {
-  const { routes, connection } = setup();
+  const { routes, issued } = await setup();
   const flow = await startLogin(routes);
   // No cookie: login CSRF attempt.
   assert.equal((await call(routes.callback, { path: flow.path, headers: HOST })).status, 403);
@@ -163,7 +156,7 @@ test('state must match the browser cookie and can be used only once', async () =
     headers: { ...HOST, cookie: other.stateCookie },
   });
   assert.equal(replay.status, 403);
-  assert.equal(connection.minted.length, 1);
+  assert.equal(issued.length, 1);
 });
 
 test('ID token checks: wrong issuer, audience, nonce, expiry and signature are all refused', async () => {
@@ -207,7 +200,7 @@ test('ID token checks: wrong issuer, audience, nonce, expiry and signature are a
     ],
   ];
   for (const [label, tamper] of cases) {
-    const { routes, connection } = setup();
+    const { routes, issued } = await setup();
     provider.tamper = tamper;
     try {
       const flow = await startLogin(routes);
@@ -216,12 +209,12 @@ test('ID token checks: wrong issuer, audience, nonce, expiry and signature are a
         headers: { ...HOST, cookie: flow.stateCookie },
       });
       assert.equal(res.status, 403, label);
-      assert.equal(connection.minted.length, 0, label);
+      assert.equal(issued.length, 0, label);
     } finally {
       provider.tamper = () => {};
     }
   }
-  const { routes, connection } = setup();
+  const { routes, issued } = await setup();
   provider.signWith = generateKeyPairSync('rsa', { modulusLength: 2048 }).privateKey;
   try {
     const flow = await startLogin(routes);
@@ -230,14 +223,14 @@ test('ID token checks: wrong issuer, audience, nonce, expiry and signature are a
       headers: { ...HOST, cookie: flow.stateCookie },
     });
     assert.equal(res.status, 403, 'signature');
-    assert.equal(connection.minted.length, 0);
+    assert.equal(issued.length, 0);
   } finally {
     provider.signWith = undefined;
   }
 });
 
 test('a provider error on the callback is refused', async () => {
-  const { routes } = setup();
+  const { routes } = await setup();
   const flow = await startLogin(routes);
   const path = flow.path.replace(/code=[^&]+/u, 'error=access_denied');
   assert.equal(
@@ -247,7 +240,7 @@ test('a provider error on the callback is refused', async () => {
 });
 
 test('sign-in only works under the configured public host', async () => {
-  const { routes } = setup();
+  const { routes } = await setup();
   assert.equal(
     (await call(routes.login, { path: '/auth/login', headers: { host: 'other.example' } })).status,
     403,
@@ -260,15 +253,15 @@ test('sign-in only works under the configured public host', async () => {
   assert.equal(res.status, 403);
 });
 
-test('an unreachable provider gives a 503 page that points to the token link', async () => {
-  const { routes } = setup({ issuer: 'http://127.0.0.1:9' });
+test("an unreachable provider gives a 503 page that points to dsh's own sign-in", async () => {
+  const { routes } = await setup({ issuer: 'http://127.0.0.1:9' });
   const res = await call(routes.login, { path: '/auth/login', headers: HOST });
   assert.equal(res.status, 503);
-  assert.match(res.body, /token/u);
+  assert.match(res.body, /href="\/"/u);
 });
 
-test('logout clears the dsh cookie for this host and ends the provider session', async () => {
-  const { routes } = setup();
+test("logout clears this plugin's and dsh's cookies for this host and ends the provider session", async () => {
+  const { routes, sessions } = await setup();
   const res = await call(routes.logout, { path: '/auth/logout', headers: HOST });
   assert.equal(res.status, 303);
   const location = new URL(String(res.headers.location));
@@ -277,64 +270,8 @@ test('logout clears the dsh cookie for this host and ends the provider session',
     location.searchParams.get('post_logout_redirect_uri'),
     'https://dsh.example/auth/login',
   );
-  const [cookie] = setCookies(res.headers);
-  assert.match(cookie ?? '', /^dsh-auth-[A-Za-z0-9_-]+=; Max-Age=0; Path=\//u);
-});
-
-test('root: a browser navigation without a session goes to the sign-in page', async () => {
-  const { routes } = setup();
-  const res = await call(routes.root, {
-    path: '/',
-    headers: { ...HOST, accept: 'text/html', 'sec-fetch-mode': 'navigate' },
-  });
-  assert.equal(res.status, 302);
-  assert.equal(res.headers.location, '/auth/login');
-});
-
-test('root: API clients and health checks still get dsh 401; token links still work', async () => {
-  const { routes, connection } = setup();
-  const curl = await call(routes.root, { path: '/', headers: HOST });
-  assert.equal(curl.status, 401);
-  assert.match(curl.body, /authentication required/u);
-  const fetchLike = await call(routes.root, {
-    path: '/',
-    headers: { ...HOST, accept: 'text/html', 'sec-fetch-mode': 'cors' },
-  });
-  assert.equal(fetchLike.status, 401);
-  const token = await call(routes.root, {
-    path: '/?token=launch-token-abc',
-    headers: { ...HOST, accept: 'text/html' },
-  });
-  assert.equal(token.status, 303);
-  assert.equal(connection.minted.length, 1);
-  const wrong = await call(routes.root, {
-    path: '/?token=nope',
-    headers: { ...HOST, accept: 'text/html' },
-  });
-  assert.equal(wrong.status, 401);
-});
-
-test('root: other hosts (e.g. the LAN address) are not redirected', async () => {
-  const { routes } = setup();
-  const res = await call(routes.root, {
-    path: '/',
-    headers: { host: '10.0.0.5:3080', accept: 'text/html' },
-  });
-  assert.equal(res.status, 401);
-});
-
-test('root: an authenticated browser gets dsh index through readResource', async () => {
-  const { routes, indexReads } = setup();
-  const res = await call(routes.root, {
-    path: '/',
-    headers: { ...HOST, accept: 'text/html', cookie: 'dsh-auth-x=cookie-for-dsh.example' },
-  });
-  assert.equal(res.status, 200);
-  assert.equal(res.body, '<html>dsh</html>');
-  assert.equal(new URL(indexReads[0]?.url ?? '').pathname, '/index.html');
-});
-
-test('root: other methods are rejected', async () => {
-  const { routes } = setup();
-  assert.equal((await call(routes.root, { path: '/', method: 'POST', headers: HOST })).status, 405);
+  const [own, token, remote] = setCookies(res.headers);
+  assert.match(own ?? '', new RegExp(`^${sessions.cookieName}=; Max-Age=0; Path=/`, 'u'));
+  assert.match(token ?? '', /^dsh-auth-[A-Za-z0-9_-]+=; Max-Age=0; Path=\//u);
+  assert.match(remote ?? '', /^dsh-remote-[A-Za-z0-9_-]+=; Max-Age=0; Path=\//u);
 });
